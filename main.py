@@ -9,22 +9,16 @@ from PIL import Image
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import glob
+import matplotlib.pyplot as plt
+import cv2
 
 # 檢查GPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print("=" * 50)
-print(f"PyTorch版本: {torch.__version__}")
-print(f"CUDA可用: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"GPU名稱: {torch.cuda.get_device_name(0)}")
-    print(f"GPU記憶體: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
-print(f"使用設備: {device}")
-print("=" * 50)
 
 # 設定參數
 IMG_SIZE = 512
-BATCH_SIZE = 16  # 可以根據GPU記憶體調整
-EPOCHS = 50
+BATCH_SIZE = 16
+EPOCHS = 30
 NUM_CLASSES = 4
 LEARNING_RATE = 0.001
 
@@ -44,12 +38,10 @@ class SleepPoseDataset(Dataset):
         return len(self.image_paths)
     
     def __getitem__(self, idx):
-        # 讀取圖片
         img_path = self.image_paths[idx]
         image = Image.open(img_path).convert('RGB')
         label = self.labels[idx]
         
-        # 應用轉換
         if self.transform:
             image = self.transform(image)
         
@@ -63,12 +55,7 @@ def load_image_paths(data_folders):
     for class_idx, folder in enumerate(data_folders):
         print(f"掃描 {folder} 的圖片...")
         
-        # 取得所有圖片檔案路徑
-        patterns = ['*.png', '*.jpg', '*.jpeg', '*.bmp']
-        files = []
-        for pattern in patterns:
-            files.extend(glob.glob(os.path.join(folder, pattern)))
-            files.extend(glob.glob(os.path.join(folder, pattern.upper())))
+        files = glob.glob(os.path.join(folder, '*.png'))
         
         print(f"  找到 {len(files)} 張圖片")
         
@@ -83,7 +70,6 @@ class CNNModel(nn.Module):
     def __init__(self, num_classes=4):
         super(CNNModel, self).__init__()
         
-        # 卷積層
         self.conv1 = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
@@ -112,11 +98,8 @@ class CNNModel(nn.Module):
             nn.MaxPool2d(2, 2)
         )
         
-        # 計算展平後的大小
-        # 512 -> 256 -> 128 -> 64 -> 32
         self.flatten_size = 256 * 32 * 32
         
-        # 全連接層
         self.fc = nn.Sequential(
             nn.Dropout(0.5),
             nn.Linear(self.flatten_size, 256),
@@ -128,15 +111,190 @@ class CNNModel(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(128, num_classes)
         )
+        
+        # 用於Grad-CAM的鉤子
+        self.gradients = None
+        self.activations = None
     
     def forward(self, x):
         x = self.conv1(x)
         x = self.conv2(x)
         x = self.conv3(x)
         x = self.conv4(x)
-        x = x.view(x.size(0), -1)  # Flatten
+        
+        # 保存最後一層卷積的激活
+        if x.requires_grad:
+            x.register_hook(self.save_gradient)
+        self.activations = x
+        
+        x = x.view(x.size(0), -1)
         x = self.fc(x)
         return x
+    
+    def save_gradient(self, grad):
+        """保存梯度"""
+        self.gradients = grad
+    
+    def get_activations_gradient(self):
+        """獲取激活的梯度"""
+        return self.gradients
+    
+    def get_activations(self):
+        """獲取激活值"""
+        return self.activations
+
+class GradCAM:
+    """Grad-CAM實現"""
+    def __init__(self, model):
+        self.model = model
+        self.model.eval()
+    
+    def generate_cam(self, input_image, target_class=None):
+        """
+        生成Grad-CAM熱力圖
+        
+        Args:
+            input_image: 輸入圖片張量 (1, C, H, W)
+            target_class: 目標類別，如果為None則使用預測類別
+        
+        Returns:
+            cam: 熱力圖
+            prediction: 預測類別
+        """
+        # 前向傳播
+        output = self.model(input_image)
+        
+        if target_class is None:
+            target_class = output.argmax(dim=1).item()
+        
+        # 反向傳播
+        self.model.zero_grad()
+        one_hot = torch.zeros_like(output)
+        one_hot[0][target_class] = 1
+        output.backward(gradient=one_hot, retain_graph=True)
+        
+        # 獲取梯度和激活
+        gradients = self.model.get_activations_gradient()
+        activations = self.model.get_activations()
+        
+        # 計算權重（全局平均池化）
+        weights = torch.mean(gradients, dim=(2, 3), keepdim=True)
+        
+        # 加權組合
+        cam = torch.sum(weights * activations, dim=1, keepdim=True)
+        cam = torch.nn.functional.relu(cam)
+        
+        # 正規化到0-1
+        cam = cam.squeeze().cpu().detach().numpy()
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        
+        return cam, target_class
+    
+    def visualize_cam(self, original_image, cam, alpha=0.5):
+        """
+        視覺化Grad-CAM
+        
+        Args:
+            original_image: 原始圖片 (PIL Image 或 numpy array)
+            cam: 熱力圖
+            alpha: 疊加透明度
+        
+        Returns:
+            疊加後的圖片
+        """
+        # 轉換原始圖片為numpy array
+        if isinstance(original_image, Image.Image):
+            original_image = np.array(original_image)
+        
+        # 調整熱力圖大小以匹配原始圖片
+        h, w = original_image.shape[:2]
+        cam_resized = cv2.resize(cam, (w, h))
+        
+        # 轉換為彩色熱力圖
+        heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
+        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+        
+        # 疊加
+        superimposed = heatmap * alpha + original_image * (1 - alpha)
+        superimposed = np.uint8(superimposed)
+        
+        return superimposed, heatmap
+
+def generate_gradcam_examples(model, test_dataset, num_examples=5, save_dir='gradcam_results'):
+    """
+    生成多個Grad-CAM範例
+    
+    Args:
+        model: 訓練好的模型
+        test_dataset: 測試資料集
+        num_examples: 生成範例數量
+        save_dir: 儲存目錄
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    gradcam = GradCAM(model)
+    model.eval()
+    
+    # 反正規化轉換
+    inv_normalize = transforms.Normalize(
+        mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
+        std=[1/0.229, 1/0.224, 1/0.225]
+    )
+    
+    print(f"\n生成 {num_examples} 個Grad-CAM視覺化範例...")
+    
+    for idx in range(min(num_examples, len(test_dataset))):
+        # 獲取測試圖片
+        img_tensor, true_label = test_dataset[idx]
+        img_path = test_dataset.image_paths[idx]
+        
+        # 讀取原始圖片
+        original_img = Image.open(img_path).convert('RGB')
+        original_img = original_img.resize((IMG_SIZE, IMG_SIZE))
+        
+        # 準備輸入
+        input_tensor = img_tensor.unsqueeze(0).to(device)
+        
+        # 生成Grad-CAM
+        cam, pred_class = gradcam.generate_cam(input_tensor)
+        
+        # 反正規化用於顯示
+        display_img = inv_normalize(img_tensor)
+        display_img = display_img.permute(1, 2, 0).cpu().numpy()
+        display_img = np.clip(display_img, 0, 1)
+        display_img = (display_img * 255).astype(np.uint8)
+        
+        # 視覺化
+        superimposed, heatmap = gradcam.visualize_cam(original_img, cam)
+        
+        # 繪製結果
+        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+        
+        axes[0].imshow(original_img)
+        axes[0].set_title(f'Original Image\nTrue: {CLASS_NAMES[true_label]}')
+        axes[0].axis('off')
+        
+        axes[1].imshow(display_img)
+        axes[1].set_title('Normalized Input')
+        axes[1].axis('off')
+        
+        axes[2].imshow(heatmap)
+        axes[2].set_title('Grad-CAM Heatmap')
+        axes[2].axis('off')
+        
+        axes[3].imshow(superimposed)
+        axes[3].set_title(f'Overlay\nPred: {CLASS_NAMES[pred_class]}')
+        axes[3].axis('off')
+        
+        plt.tight_layout()
+        
+        # 儲存
+        save_path = os.path.join(save_dir, f'gradcam_example_{idx+1}.png')
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"  [{idx+1}/{num_examples}] 已儲存: {save_path}")
+        print(f"    真實標籤: {CLASS_NAMES[true_label]}, 預測標籤: {CLASS_NAMES[pred_class]}")
 
 def train_epoch(model, dataloader, criterion, optimizer, device):
     """訓練一個epoch"""
@@ -149,22 +307,18 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
     for images, labels in pbar:
         images, labels = images.to(device), labels.to(device)
         
-        # 前向傳播
         optimizer.zero_grad()
         outputs = model(images)
         loss = criterion(outputs, labels)
         
-        # 反向傳播
         loss.backward()
         optimizer.step()
         
-        # 統計
         running_loss += loss.item()
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
         
-        # 更新進度條
         pbar.set_postfix({
             'loss': f'{running_loss/len(pbar):.4f}',
             'acc': f'{100.*correct/total:.2f}%'
@@ -250,19 +404,14 @@ def main():
     for epoch in range(EPOCHS):
         print(f"\nEpoch {epoch+1}/{EPOCHS}")
         
-        # 訓練
         train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
-        
-        # 驗證
         val_loss, val_acc = validate(model, test_loader, criterion, device)
         
-        # 調整學習率
         scheduler.step(val_loss)
         
         print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
         print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
         
-        # 保存最佳模型
         if val_acc > best_acc:
             best_acc = val_acc
             torch.save({
@@ -273,7 +422,6 @@ def main():
             }, 'best_model.pth')
             print(f"✓ 保存最佳模型 (準確率: {best_acc:.2f}%)")
         
-        # 清理GPU記憶體
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     
@@ -282,6 +430,12 @@ def main():
     # 保存最終模型
     torch.save(model.state_dict(), 'final_model.pth')
     print("模型已儲存為 final_model.pth")
+    
+    # 生成Grad-CAM視覺化
+    print("\n" + "="*50)
+    print("生成 Grad-CAM 視覺化...")
+    print("="*50)
+    generate_gradcam_examples(model, test_dataset, num_examples=10)
     
     return model
 
