@@ -18,14 +18,14 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # 設定參數
 IMG_SIZE = 512
 BATCH_SIZE = 16
-EPOCHS = 30
+EPOCHS = 40
 NUM_CLASSES = 4
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0005
 
 # 資料夾路徑
 BASE_DIR = 'data/generated_images'
 DATA_FOLDERS = [os.path.join(BASE_DIR, f'{c}') for c in ['back', 'fetal', 'side', 'stomach']]
-CLASS_NAMES = ['A', 'B', 'C', 'D']
+CLASS_NAMES = ['Back', 'Fetal', 'Side', 'Stomach']
 
 class SleepPoseDataset(Dataset):
     """自定義資料集類別"""
