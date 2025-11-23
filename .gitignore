@@ -2,6 +2,6 @@ __pycache__/
 ml/
 *.h5
 *.pth
-test.py
+test/
 note.txt
-gradcam_results/
+split_info.pt
